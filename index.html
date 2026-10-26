@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sheriff Robot View</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 24px; background: #080b10; color: #d9e6f2;
+      font-family: Consolas, "Courier New", monospace; display: flex;
+      flex-direction: column; align-items: center; gap: 16px;
+    }
+    h1 { margin: 0; color: #59f3ff; font-size: clamp(1.25rem, 4vw, 2rem); letter-spacing: 2px; }
+    .subtitle { margin: 0; color: #8ca4b8; text-align: center; }
+    .controls { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+    button {
+      padding: 10px 16px; border: 1px solid #59f3ff; border-radius: 6px;
+      background: #10232b; color: #59f3ff; font: inherit; cursor: pointer;
+    }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    #status { min-height: 1.4em; color: #ffd166; text-align: center; }
+    .screen {
+      position: relative; width: min(960px, 100%); background: #000;
+      border: 1px solid #24505b; box-shadow: 0 0 24px #00d9ff22;
+      overflow: hidden; line-height: 0;
+    }
+    video { display: block; width: 100%; height: auto; transform: scaleX(-1); }
+    canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+    .note { max-width: 960px; color: #8ca4b8; font: 13px/1.5 Arial, sans-serif; }
+  </style>
+</head>
+<body>
+  <h1>SHERIFF ROBOT VIEW</h1>
+  <p class="subtitle">FACE TRACKING SYSTEM / LIVE CAMERA</p>
+  <div class="controls">
+    <button id="startBtn">카메라 시작</button>
+    <button id="stopBtn" disabled>카메라 종료</button>
+  </div>
+  <div id="status">시작 버튼을 눌러 카메라 권한을 허용하세요.</div>
+  <div class="screen">
+    <video id="video" autoplay muted playsinline></video>
+    <canvas id="overlay"></canvas>
+  </div>
+  <p class="note">
+    카메라 기능은 localhost 또는 HTTPS에서 실행해야 합니다. 얼굴 탐지 모델을 처음 사용할 때는
+    인터넷 연결이 필요합니다. X/Y는 화면 중심을 기준으로 한 상대 좌표이며, Z는 실제 거리가 아닌
+    얼굴 크기를 이용한 대략적인 상대 거리입니다.
+  </p>
+
+  <script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+  <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('overlay');
+    const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const MODEL_URL = 'https://justadudewhohacks.github.io/face-api.js/models';
+
+    let stream = null;
+    let running = false;
+    let busy = false;
+
+    function resizeCanvas() {
+      const w = video.videoWidth || 640;
+      const h = video.videoHeight || 480;
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w;
+        canvas.height = h;
+      }
+    }
+
+    function drawText(text, x, y, color = '#59f3ff', size = 18) {
+      ctx.font = `bold ${size}px Consolas, monospace`;
+      ctx.fillStyle = color;
+      ctx.fillText(text, x, y);
+    }
+
+    function drawOverlay(detection) {
+      resizeCanvas();
+      const w = canvas.width, h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+
+      // Mirrored display: mirror the overlay coordinates to match the video.
+      ctx.save();
+      ctx.translate(w, 0);
+      ctx.scale(-1, 1);
+
+      const b = detection.box;
+      const close = b.width / w > 0.35;
+      ctx.strokeStyle = close ? '#ff4d6d' : '#59f3ff';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(b.x, b.y, b.width, b.height);
+
+      const cx = b.x + b.width / 2, cy = b.y + b.height / 2;
+      ctx.beginPath();
+      ctx.moveTo(cx - 18, cy); ctx.lineTo(cx + 18, cy);
+      ctx.moveTo(cx, cy - 18); ctx.lineTo(cx, cy + 18);
+      ctx.stroke();
+
+      drawText(close ? 'WARNING! TOO CLOSE!' : 'TARGET LOCKED',
+        Math.max(12, b.x), Math.max(28, b.y - 10), close ? '#ff4d6d' : '#59f3ff', 18);
+      ctx.restore();
+
+      // Draw the coordinate panel after restoring the canvas so its text is readable.
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.78)';
+      ctx.fillRect(12, 12, 245, 104);
+      drawText('X: ' + detection.x.toFixed(2), 26, 40);
+      drawText('Y: ' + detection.y.toFixed(2), 26, 67);
+      drawText('Z: ' + detection.z.toFixed(0) + ' (REL)', 26, 94);
+
+      statusEl.textContent = close ? '경고: 얼굴이 카메라에 너무 가까울 수 있습니다.' : '얼굴 감지 중';
+      statusEl.style.color = close ? '#ff4d6d' : '#59f3ff';
+    }
+
+    async function detectLoop() {
+      if (!running) return;
+      if (!busy && video.readyState >= 2 && window.faceapi) {
+        busy = true;
+        try {
+          const result = await faceapi.detectSingleFace(
+            video,
+            new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 })
+          );
+          resizeCanvas();
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          if (result) {
+            const b = result.box;
+            const w = canvas.width, h = canvas.height;
+            // X/Y are normalized relative to the frame center.
+            const x = ((b.x + b.width / 2) - w / 2) / (w / 2);
+            const y = ((b.y + b.height / 2) - h / 2) / (h / 2);
+            const z = b.width > 0 ? (100 * 200 / b.width) : 0;
+            drawOverlay({ box: b, x, y, z });
+          } else {
+            statusEl.textContent = '얼굴을 찾지 못했습니다. 카메라를 바라봐 주세요.';
+            statusEl.style.color = '#ffd166';
+          }
+        } catch (err) {
+          console.error(err);
+          statusEl.textContent = '얼굴 감지 중 오류가 발생했습니다. 인터넷 연결을 확인하세요.';
+          statusEl.style.color = '#ff4d6d';
+        } finally {
+          busy = false;
+        }
+      }
+      if (running) requestAnimationFrame(detectLoop);
+    }
+
+    async function startCamera() {
+      startBtn.disabled = true;
+      statusEl.textContent = '얼굴 인식 모델을 불러오는 중...';
+      try {
+        if (!window.faceapi) throw new Error('face-api.js를 불러오지 못했습니다. 인터넷 연결을 확인하세요.');
+        await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'user' }, audio: false
+        });
+        video.srcObject = stream;
+        await video.play();
+        running = true;
+        stopBtn.disabled = false;
+        statusEl.textContent = '카메라가 시작되었습니다.';
+        detectLoop();
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = '실행 실패: ' + (err.message || '카메라 권한 또는 HTTPS 연결을 확인하세요.');
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+        if (stream) stream.getTracks().forEach(track => track.stop());
+        stream = null;
+      }
+    }
+
+    function stopCamera() {
+      running = false;
+      if (stream) stream.getTracks().forEach(track => track.stop());
+      stream = null;
+      video.srcObject = null;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      statusEl.textContent = '카메라가 종료되었습니다.';
+      statusEl.style.color = '#ffd166';
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+    }
+
+    startBtn.addEventListener('click', startCamera);
+    stopBtn.addEventListener('click', stopCamera);
+    window.addEventListener('beforeunload', stopCamera);
+  </script>
+</body>
+</html>
